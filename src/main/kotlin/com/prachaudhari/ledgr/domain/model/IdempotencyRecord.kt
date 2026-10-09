@@ -1,6 +1,8 @@
 package com.prachaudhari.ledgr.domain.model
 
 import jakarta.persistence.*
+import org.hibernate.annotations.JdbcTypeCode
+import org.hibernate.type.SqlTypes
 import java.time.Instant
 
 @Entity
@@ -13,6 +15,7 @@ class IdempotencyRecord(
     @Column(nullable = false, length = 20)
     var status: String = "STARTED",
 
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb")
     var response: String? = null,
 

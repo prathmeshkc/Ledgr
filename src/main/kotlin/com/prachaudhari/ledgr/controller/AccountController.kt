@@ -46,6 +46,11 @@ class AccountController(
             return ResponseEntity.badRequest().build()
         }
 
+        val existing = accountRepository.findByName(request.name)
+        if (existing != null) {
+            return ResponseEntity.ok(existing.toResponse())
+        }
+
         val account = Account(
             name = request.name,
             type = accountType

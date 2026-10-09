@@ -1,6 +1,8 @@
 package com.prachaudhari.ledgr.domain.model
 
 import jakarta.persistence.*
+import org.hibernate.annotations.JdbcTypeCode
+import org.hibernate.type.SqlTypes
 import java.time.Instant
 import java.util.UUID
 
@@ -20,6 +22,7 @@ class OutboxEvent(
     @Column(name = "event_type", nullable = false, length = 100)
     val eventType: String,
 
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(nullable = false, columnDefinition = "jsonb")
     val payload: String,
 
