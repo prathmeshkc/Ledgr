@@ -80,6 +80,14 @@ class PaymentServiceImpl(
         val payment = paymentRepository.findById(paymentId)
             .orElseThrow { IllegalArgumentException("Payment not found: $paymentId") }
 
+        // Check if source account has sufficient balance
+        val sourceBalance = ledgerService.getBalance(payment.sourceAccount.id!!)
+        if (sourceBalance < payment.amount) {
+            throw IllegalArgumentException(
+                "Insufficient balance: account ${payment.sourceAccount.id} has $sourceBalance but payment requires ${payment.amount}"
+            )
+        }
+
         // State machine validates: only INITIATED → AUTHORIZED is allowed
         payment.transitionTo(PaymentStatus.AUTHORIZED)
         paymentRepository.save(payment)
