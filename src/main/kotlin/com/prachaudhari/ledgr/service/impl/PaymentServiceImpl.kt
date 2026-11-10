@@ -4,13 +4,13 @@ import tools.jackson.databind.ObjectMapper
 import com.prachaudhari.ledgr.domain.event.PaymentEvent
 import com.prachaudhari.ledgr.domain.model.*
 import com.prachaudhari.ledgr.repository.AccountRepository
-import com.prachaudhari.ledgr.repository.IdempotencyRecordRepository
-import com.prachaudhari.ledgr.repository.OutboxEventRepository
 import com.prachaudhari.ledgr.repository.PaymentRepository
+import com.prachaudhari.ledgr.repository.OutboxEventRepository
 import com.prachaudhari.ledgr.service.LedgerService
 import com.prachaudhari.ledgr.service.PaymentService
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import org.springframework.transaction.support.TransactionTemplate
 import java.math.BigDecimal
 import java.util.UUID
 
@@ -18,13 +18,13 @@ import java.util.UUID
 class PaymentServiceImpl(
     private val paymentRepository: PaymentRepository,
     private val accountRepository: AccountRepository,
-    private val idempotencyRecordRepository: IdempotencyRecordRepository,
     private val outboxEventRepository: OutboxEventRepository,
     private val ledgerService: LedgerService,
-    private val objectMapper: ObjectMapper
+    private val idempotencyService: IdempotencyService,
+    private val objectMapper: ObjectMapper,
+    private val transactionTemplate: TransactionTemplate
 ) : PaymentService {
 
-    @Transactional
     override fun createPayment(
         idempotencyKey: String,
         sourceAccountId: UUID,
@@ -32,45 +32,59 @@ class PaymentServiceImpl(
         amount: BigDecimal,
         currency: String
     ): Payment? {
-        // Check idempotency: has this key been used before?
-        val existingRecord = idempotencyRecordRepository.findById(idempotencyKey).orElse(null)
-        if (existingRecord != null) {
-            if (existingRecord.status == "COMPLETE") {
-                // Return the original payment — this is a retry
-                return paymentRepository.findByIdempotencyKey(idempotencyKey)
+        // Claim the idempotency key in an isolated transaction.
+        // This runs in REQUIRES_NEW so a constraint violation from a concurrent
+        // insert race rolls back only the inner transaction, not this one.
+        return when (idempotencyService.claimKey(idempotencyKey)) {
+            is IdempotencyService.ClaimResult.AlreadyComplete -> {
+                paymentRepository.findByIdempotencyKey(idempotencyKey)
             }
-            // Status is STARTED — previous request still in-flight
-            return null
+            is IdempotencyService.ClaimResult.InFlight -> null
+            is IdempotencyService.ClaimResult.RaceLost -> {
+                // The winning thread claimed the key but may not have committed
+                // the payment yet. Wait briefly then look it up.
+                Thread.sleep(100)
+                paymentRepository.findByIdempotencyKey(idempotencyKey)
+            }
+            is IdempotencyService.ClaimResult.Claimed -> {
+                createNewPayment(idempotencyKey, sourceAccountId, destinationAccountId, amount, currency)
+            }
         }
+    }
 
-        // Create idempotency record to claim this key
-        val idempotencyRecord = IdempotencyRecord(key = idempotencyKey)
-        idempotencyRecordRepository.save(idempotencyRecord)
+    private fun createNewPayment(
+        idempotencyKey: String,
+        sourceAccountId: UUID,
+        destinationAccountId: UUID,
+        amount: BigDecimal,
+        currency: String
+    ): Payment {
+        // Payment + outbox write must be atomic, so we use TransactionTemplate
+        // instead of @Transactional (which doesn't work on self-invoked private methods).
+        val payment = transactionTemplate.execute {
+            val sourceAccount = accountRepository.findById(sourceAccountId)
+                .orElseThrow { IllegalArgumentException("Source account not found: $sourceAccountId") }
+            val destinationAccount = accountRepository.findById(destinationAccountId)
+                .orElseThrow { IllegalArgumentException("Destination account not found: $destinationAccountId") }
 
-        // Look up the source and destination accounts
-        val sourceAccount = accountRepository.findById(sourceAccountId)
-            .orElseThrow { IllegalArgumentException("Source account not found: $sourceAccountId") }
-        val destinationAccount = accountRepository.findById(destinationAccountId)
-            .orElseThrow { IllegalArgumentException("Destination account not found: $destinationAccountId") }
+            val p = Payment(
+                idempotencyKey = idempotencyKey,
+                sourceAccount = sourceAccount,
+                destinationAccount = destinationAccount,
+                amount = amount,
+                currency = currency
+            )
+            paymentRepository.save(p)
+            writeOutboxEvent(p, "PAYMENT_CREATED")
+            p
+        }!!
 
-        // Create the payment in INITIATED status
-        val payment = Payment(
-            idempotencyKey = idempotencyKey,
-            sourceAccount = sourceAccount,
-            destinationAccount = destinationAccount,
-            amount = amount,
-            currency = currency
+        idempotencyService.completeKey(
+            idempotencyKey,
+            objectMapper.writeValueAsString(
+                mapOf("paymentId" to payment.id, "status" to payment.status.name)
+            )
         )
-        paymentRepository.save(payment)
-
-        // Write outbox event — will be published to Kafka by the outbox poller
-        writeOutboxEvent(payment, "PAYMENT_CREATED")
-
-        // Mark idempotency record as complete with the response
-        idempotencyRecord.complete(objectMapper.writeValueAsString(
-            mapOf("paymentId" to payment.id, "status" to payment.status.name)
-        ))
-        idempotencyRecordRepository.save(idempotencyRecord)
 
         return payment
     }
